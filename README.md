@@ -332,6 +332,84 @@ For faster development cycles, you can run the server locally and expose it to t
 
 You can now call your Twilio number, and the request will be forwarded to your local machine for debugging.
 
+## Escalation Handling
+
+When a CX Agent Studio agent escalates to a human (using the `end_session` tool with an escalation reason), the adapter can automatically:
+
+1. **Send webhook notification**: POST escalation context to a configured URL
+2. **Transfer the call**: Use the `/transfer` endpoint to create an attended transfer with agent acceptance
+
+This feature is currently available for **voice calls only**.
+
+### Configuration
+
+Set these environment variables in your `.env` file (local) or `script/values.sh` (Cloud Run):
+
+**Required for call transfer:**
+- `BASE_URL`: Base URL of your application (auto-generated from `PUBLIC_SERVER_HOSTNAME`)
+- `TWILIO_SYNC_SERVICE_SID`: Twilio Sync service SID
+- `TWILIO_SYNC_MAP_SID`: Twilio Sync map SID for storing call context
+- `AGENT_PHONE_NUMBER`: Phone number to transfer calls to (E.164 format, e.g., `+18005551234`)
+- `TWILIO_PHONE_NUMBER`: Twilio number to use for outbound calls to agent
+
+**Optional:**
+- `ESCALATION_WEBHOOK_URL`: URL to receive escalation notifications
+
+**Example `.env` configuration:**
+```dotenv
+# Required for transfer functionality
+TWILIO_SYNC_SERVICE_SID=ISxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_SYNC_MAP_SID=MPxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_PHONE_NUMBER=+18005551212
+AGENT_PHONE_NUMBER=+18005551234
+BASE_URL=https://your-app.run.app
+
+# Optional webhook notification
+ESCALATION_WEBHOOK_URL=https://your-system.com/api/escalations
+```
+
+### Webhook Payload
+
+When an escalation is detected, the webhook receives a POST request with this JSON payload:
+
+```json
+{
+  "event": "escalation_detected",
+  "session_id": "projects/.../sessions/...",
+  "call_sid": "CA...",
+  "from_number": "+19786783416",
+  "to_number": "+18005551212",
+  "escalation": {
+    "reason": "escalate_to_human",
+    "timestamp": "2026-03-19T10:30:00Z",
+    "context": {},
+    "metadata": {},
+    "raw_end_session": {}
+  }
+}
+```
+
+### How It Works
+
+1. Your CX Agent Studio agent calls the `end_session` tool with a reason indicating escalation (e.g., `escalate_to_human`)
+2. The adapter detects the escalation in the WebSocket response
+3. If configured, the adapter sends a webhook notification with the session context
+4. The adapter calls the `/transfer` endpoint to initiate an attended transfer:
+   - Customer is placed in a conference
+   - Agent receives a call with the context
+   - Agent presses 1 to accept and join the conference
+5. Both parties are connected in the conference call
+
+### Error Handling
+
+All escalation actions are best-effort and won't block session closure:
+- Webhook failures are logged but don't prevent call transfer
+- Transfer failures are logged with full traceback
+- Missing configuration results in warnings, actions are skipped gracefully
+- Invalid context uses available data and proceeds with partial context
+
+This ensures the call always closes properly even if escalation handling fails.
+
 ## Important Notes
 
 *   **Token Expiration (Override Method):** If you are using the Secret Manager override for authentication, remember that the access token expires (typically after 1 hour). For a production deployment, you will need to periodically run the `gcloud secrets versions add ...` command to update the secret with a fresh token. A more robust, long-term solution would involve a mechanism to programmatically refresh and update the token.

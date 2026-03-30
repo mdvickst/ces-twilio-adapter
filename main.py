@@ -38,9 +38,14 @@ from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 
 # Import the REST API Client
-from twilio.twiml.voice_response import Connect, VoiceResponse
+from twilio.twiml.voice_response import Connect, Dial, Gather, VoiceResponse
 from websockets.protocol import State as WebsocketProtocolState
 
+from escalation_handler import (
+    detect_escalation,
+    send_escalation_webhook,
+    transfer_call_to_human,
+)
 from message_handler import process_incoming_message
 from phone_number_mapping import get_agent_for_phone_number_async
 from secrets_utils import flush_token_cache, get_token_from_secret_manager_async
@@ -49,6 +54,9 @@ from twilio_utils import validate_twilio_signature
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Suppress verbose Twilio HTTP client logs
+logging.getLogger("twilio.http_client").setLevel(logging.WARNING)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -69,9 +77,13 @@ VA_HOSTNAME_MAP = {
 # Twilio credentials
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID").strip()
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN").strip()
+TWILIO_SYNC_SERVICE_SID = os.getenv("TWILIO_SYNC_SERVICE_SID")
+TWILIO_SYNC_MAP_SID = os.getenv("TWILIO_SYNC_MAP_SID")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
 # The public hostname where this server is accessible
 PUBLIC_SERVER_HOSTNAME = os.getenv("PUBLIC_SERVER_HOSTNAME")
+BASE_URL = os.getenv("BASE_URL", f"https://{PUBLIC_SERVER_HOSTNAME}" if PUBLIC_SERVER_HOSTNAME else None)
 
 # Twilio request validator
 validator = RequestValidator(TWILIO_AUTH_TOKEN)
@@ -173,6 +185,7 @@ async def handle_incoming_call(request: Request):
     # Make sure this is really Twilio
     twilio_signature = request.headers.get("X-Twilio-Signature") or ""
     form_params = await request.form()
+    # logger.info(f"Twilio signature from headers: {twilio_signature} for request URL: {request.url} and form params: {form_params}")
     if not validate_twilio_signature(
         str(request.url), form_params, twilio_signature, validator
     ):
@@ -241,6 +254,8 @@ async def handle_incoming_call(request: Request):
     connect = Connect()
     stream = connect.stream(url=f"wss://{PUBLIC_SERVER_HOSTNAME}/media-stream")
     stream.parameter(name="session_id", value=session_id)
+    stream.parameter(name="From", value=form_params.get("From"))
+    stream.parameter(name="To", value=to_number)
     if deployment_id:
         stream.parameter(name="deployment_id", value=deployment_id)
     stream.parameter(name="virtual_agent_endpoint", value=virtual_agent_endpoint)
@@ -257,6 +272,565 @@ async def handle_incoming_message(request: Request):
     It validates the request, processes the message, and sends a reply.
     """
     return await process_incoming_message(request, validator, client)
+
+
+# === Call Transfer Endpoints (from GoogleCESTransfers/app.py) ===
+
+
+@app.post("/transfer")
+async def transfer(request: Request):
+    """
+    Receives call SID and context from Google CES.
+    Updates the call with conference TwiML and creates a new call to gather agent acceptance.
+    """
+    try:
+        # Get parameters from request (support both form and JSON)
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            data = await request.json()
+            call_sid = data.get("CallSid") or data.get("call_sid")
+            context = data.get("context", "")
+            from_number = data.get("From") or data.get("from_number")
+            to_number = data.get("To") or data.get("to_number")
+        else:
+            form_data = await request.form()
+            call_sid = form_data.get("CallSid")
+            context = form_data.get("context", "")
+            from_number = form_data.get("From")
+            to_number = form_data.get("To")
+
+        if not call_sid:
+            raise HTTPException(status_code=400, detail="CallSid is required")
+
+        logger.info(
+            f"Transfer endpoint received: CallSid={call_sid}, "
+            f"From={from_number}, To={to_number}, Context='{context}'"
+        )
+
+        if not TWILIO_SYNC_SERVICE_SID or not TWILIO_SYNC_MAP_SID:
+            raise HTTPException(
+                status_code=500,
+                detail="TWILIO_SYNC_SERVICE_SID and TWILIO_SYNC_MAP_SID must be configured"
+            )
+
+        # Create unique conference name
+        conference_name = f"conf_{uuid.uuid4().hex[:12]}"
+
+        # Create caller key for Sync Map (caller ID without '+')
+        caller_key = TWILIO_PHONE_NUMBER.replace("+", "")
+        logger.info(f"Using caller_key={caller_key} for Sync Map")
+
+        # Store or update the context in Sync Map
+        try:
+            client.sync.v1.services(TWILIO_SYNC_SERVICE_SID) \
+                .sync_maps(TWILIO_SYNC_MAP_SID) \
+                .sync_map_items(caller_key) \
+                .fetch() \
+                .update(data={
+                    "context": context,
+                    "conference_name": conference_name,
+                    "from": from_number,
+                    "to": to_number,
+                    "original_call_sid": call_sid
+                })
+        except Exception:
+            # Create new item if it doesn't exist
+            client.sync.v1.services(TWILIO_SYNC_SERVICE_SID) \
+                .sync_maps(TWILIO_SYNC_MAP_SID) \
+                .sync_map_items.create(
+                    key=caller_key,
+                    data={
+                        "context": context,
+                        "conference_name": conference_name,
+                        "from": from_number,
+                        "to": to_number,
+                        "original_call_sid": call_sid
+                    }
+                )
+
+        # Verify what was stored by reading it back
+        try:
+            verification = client.sync.v1.services(TWILIO_SYNC_SERVICE_SID) \
+                .sync_maps(TWILIO_SYNC_MAP_SID) \
+                .sync_map_items(caller_key) \
+                .fetch()
+            logger.info(
+                f"Verified Sync storage for caller_key={caller_key}: {verification.data}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to verify Sync storage: {e}")
+
+        # Update the original call with conference TwiML
+        response = VoiceResponse()
+        dial = Dial()
+        dial.conference(conference_name)
+        response.append(dial)
+
+        client.calls(call_sid).update(twiml=str(response))
+
+        # Create a new call to the agent with gather TwiML
+        agent_number = os.getenv("AGENT_PHONE_NUMBER", TWILIO_PHONE_NUMBER)
+
+        # Create the call with gather URL
+        gather_url = f"{BASE_URL}/gatherAgent?conference={conference_name}&caller={caller_key}"
+
+        new_call = client.calls.create(
+            to=agent_number,
+            from_=TWILIO_PHONE_NUMBER,
+            url=gather_url,
+            method="POST"
+        )
+
+        return {
+            "success": True,
+            "conference_name": conference_name,
+            "original_call_sid": call_sid,
+            "agent_call_sid": new_call.sid,
+            "caller_key": caller_key
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Transfer error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/gatherAgent")
+@app.get("/gatherAgent")
+async def gather_agent(request: Request):
+    """
+    Serves TwiML for gathering agent acceptance.
+    Loops back to itself if no input after 5 seconds.
+    """
+    conference_name = request.query_params.get("conference")
+    caller_key = request.query_params.get("caller")
+
+    response = VoiceResponse()
+
+    # Create gather with 1 digit or speech input, 5 second timeout
+    gather = Gather(
+        num_digits=1,
+        speech_timeout=1,
+        timeout=5,
+        input="dtmf speech",
+        action=f"{BASE_URL}/conference?conference={conference_name}&caller={caller_key}",
+        method="POST"
+    )
+
+    gather.say("Please press 1 or say anything to accept call from virtual agent.")
+    response.append(gather)
+
+    # If no input, loop back to this endpoint
+    response.redirect(f"{BASE_URL}/gatherAgent?conference={conference_name}&caller={caller_key}")
+
+    return HTMLResponse(content=str(response), media_type="text/xml")
+
+
+@app.post("/conference")
+async def conference(request: Request):
+    """
+    Action URL for the gather. Retrieves context and joins the conference.
+    """
+    try:
+        conference_name = request.query_params.get("conference")
+        caller_key = request.query_params.get("caller")
+
+        form_data = await request.form()
+        digits = form_data.get("Digits", "")
+        speech_result = form_data.get("SpeechResult", "")
+        logger.info(f"Received gather input: digits={digits}, speech_result={speech_result}")
+        response = VoiceResponse()
+
+        # Only proceed if agent pressed 1 OR said anything
+        if digits == "1" or speech_result:
+            # Retrieve context from Sync Map
+            try:
+                sync_item = client.sync.v1.services(TWILIO_SYNC_SERVICE_SID) \
+                    .sync_maps(TWILIO_SYNC_MAP_SID) \
+                    .sync_map_items(caller_key) \
+                    .fetch()
+
+                context_data = sync_item.data
+                context_message = context_data.get("context", "No context available")
+
+                # Extract the order information from the context
+                order_info = context_message
+                logger.info(f"Extracted context for conference join: '{context_message}'")
+                
+                # If it starts with "Escalation reason:", extract just that part
+                if "Escalation reason:" in context_message:
+                    order_info = context_message.split("Escalation reason:")[1].strip()
+                    # Remove the period at the end if present
+                    if order_info.endswith("."):
+                        order_info = order_info[:-1]
+
+                # If it has order_details field, extract that instead
+                if "order_details:" in context_message:
+                    order_info = context_message.split("order_details:")[1].strip()
+                    if order_info.endswith("."):
+                        order_info = order_info[:-1]
+
+                # Say the order information
+                response.say(f"The caller would like to order {order_info}")
+
+            except Exception as e:
+                logger.error(f"Failed to retrieve context: {e}", exc_info=True)
+                response.say("Unable to retrieve call context.")
+
+            # Join the conference
+            dial = Dial()
+            dial.conference(conference_name)
+            response.append(dial)
+        else:
+            # Agent didn't press 1, reject the call
+            response.say("Call not accepted. Goodbye.")
+            response.hangup()
+
+        return HTMLResponse(content=str(response), media_type="text/xml")
+
+    except Exception as e:
+        logger.error(f"Conference join error: {e}", exc_info=True)
+        response = VoiceResponse()
+        response.say("An error occurred. Please try again.")
+        response.hangup()
+        return HTMLResponse(content=str(response), media_type="text/xml")
+
+
+@app.post("/api/context")
+async def store_context(request: Request):
+    """
+    API endpoint to store context in Sync Map.
+    """
+    try:
+        data = await request.json()
+        caller_key = data.get("caller_key")
+        context = data.get("context")
+
+        if not caller_key or not context:
+            raise HTTPException(
+                status_code=400,
+                detail="caller_key and context are required"
+            )
+
+        if not TWILIO_SYNC_SERVICE_SID or not TWILIO_SYNC_MAP_SID:
+            raise HTTPException(
+                status_code=500,
+                detail="TWILIO_SYNC_SERVICE_SID and TWILIO_SYNC_MAP_SID must be configured"
+            )
+
+        # Store or update the context
+        try:
+            client.sync.v1.services(TWILIO_SYNC_SERVICE_SID) \
+                .sync_maps(TWILIO_SYNC_MAP_SID) \
+                .sync_map_items(caller_key) \
+                .fetch() \
+                .update(data={"context": context})
+        except Exception:
+            # Create new item if it doesn't exist
+            client.sync.v1.services(TWILIO_SYNC_SERVICE_SID) \
+                .sync_maps(TWILIO_SYNC_MAP_SID) \
+                .sync_map_items.create(
+                    key=caller_key,
+                    data={"context": context}
+                )
+
+        return {"success": True, "caller_key": caller_key}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Store context error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/context/{caller_key}")
+async def get_context(caller_key: str):
+    """
+    API endpoint to retrieve context from Sync Map.
+    """
+    try:
+        if not TWILIO_SYNC_SERVICE_SID or not TWILIO_SYNC_MAP_SID:
+            raise HTTPException(
+                status_code=500,
+                detail="TWILIO_SYNC_SERVICE_SID and TWILIO_SYNC_MAP_SID must be configured"
+            )
+
+        sync_item = client.sync.v1.services(TWILIO_SYNC_SERVICE_SID) \
+            .sync_maps(TWILIO_SYNC_MAP_SID) \
+            .sync_map_items(caller_key) \
+            .fetch()
+
+        return {
+            "success": True,
+            "caller_key": caller_key,
+            "data": sync_item.data
+        }
+
+    except Exception as e:
+        logger.error(f"Get context error for {caller_key}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=404,
+            detail=f"Context not found: {str(e)}"
+        )
+
+
+@app.get("/view")
+async def view_context(request: Request):
+    """
+    HTML interface to display context from Sync Map.
+    Can be iframed into another application.
+    """
+    caller_key = request.query_params.get("caller", "")
+
+    html_template = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Call Context Viewer</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                padding: 20px;
+                min-height: 100vh;
+            }
+
+            .container {
+                max-width: 800px;
+                margin: 0 auto;
+                background: white;
+                border-radius: 12px;
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+                overflow: hidden;
+            }
+
+            .header {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 30px;
+                text-align: center;
+            }
+
+            .header h1 {
+                font-size: 28px;
+                margin-bottom: 10px;
+            }
+
+            .header p {
+                font-size: 14px;
+                opacity: 0.9;
+            }
+
+            .content {
+                padding: 30px;
+            }
+
+            .info-section {
+                margin-bottom: 25px;
+                padding-bottom: 25px;
+                border-bottom: 1px solid #e0e0e0;
+            }
+
+            .info-section:last-child {
+                border-bottom: none;
+                margin-bottom: 0;
+                padding-bottom: 0;
+            }
+
+            .label {
+                font-size: 12px;
+                font-weight: 600;
+                text-transform: uppercase;
+                color: #667eea;
+                letter-spacing: 0.5px;
+                margin-bottom: 8px;
+            }
+
+            .value {
+                font-size: 16px;
+                color: #333;
+                line-height: 1.6;
+                word-wrap: break-word;
+            }
+
+            .context-box {
+                background: #f8f9fa;
+                border-left: 4px solid #667eea;
+                padding: 20px;
+                border-radius: 6px;
+                margin-top: 10px;
+            }
+
+            .error {
+                background: #fff3f3;
+                border-left: 4px solid #dc3545;
+                padding: 20px;
+                border-radius: 6px;
+                color: #dc3545;
+                text-align: center;
+            }
+
+            .loading {
+                text-align: center;
+                padding: 40px;
+                color: #667eea;
+            }
+
+            .spinner {
+                border: 3px solid #f3f3f3;
+                border-top: 3px solid #667eea;
+                border-radius: 50%;
+                width: 40px;
+                height: 40px;
+                animation: spin 1s linear infinite;
+                margin: 0 auto 20px;
+            }
+
+            @keyframes spin {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+
+            .refresh-btn {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                padding: 12px 30px;
+                border-radius: 6px;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: transform 0.2s;
+                margin-top: 20px;
+                width: 100%;
+            }
+
+            .refresh-btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+            }
+
+            .refresh-btn:active {
+                transform: translateY(0);
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>Call Context Viewer</h1>
+                <p>Real-time call context information</p>
+            </div>
+            <div class="content" id="content">
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <p>Loading context...</p>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            const callerKey = """ + f'"{caller_key}"' + """;
+
+            async function loadContext() {
+                const content = document.getElementById('content');
+
+                if (!callerKey) {
+                    content.innerHTML = `
+                        <div class="info-section">
+                            <div class="label">Waiting for call</div>
+                            <div class="value" style="color: #999;">No active call context. Provide a <code>?caller=key</code> parameter to view call details.</div>
+                        </div>
+                    `;
+                    return;
+                }
+
+                try {
+                    const response = await fetch(`/api/context/${callerKey}`);
+                    const data = await response.json();
+
+                    if (data.error || !data.success) {
+                        content.innerHTML = `
+                            <div class="error">
+                                <strong>Error:</strong> ${data.error || data.detail || 'Unknown error'}
+                            </div>
+                            <button class="refresh-btn" onclick="loadContext()">Retry</button>
+                        `;
+                        return;
+                    }
+
+                    const contextData = data.data || {};
+
+                    content.innerHTML = `
+                        <div class="info-section">
+                            <div class="label">Caller ID</div>
+                            <div class="value">${callerKey}</div>
+                        </div>
+
+                        ${contextData.from ? `
+                        <div class="info-section">
+                            <div class="label">From Number</div>
+                            <div class="value">${contextData.from}</div>
+                        </div>
+                        ` : ''}
+
+                        ${contextData.to ? `
+                        <div class="info-section">
+                            <div class="label">To Number</div>
+                            <div class="value">${contextData.to}</div>
+                        </div>
+                        ` : ''}
+
+                        ${contextData.conference_name ? `
+                        <div class="info-section">
+                            <div class="label">Conference Name</div>
+                            <div class="value">${contextData.conference_name}</div>
+                        </div>
+                        ` : ''}
+
+                        <div class="info-section">
+                            <div class="label">Context Information</div>
+                            <div class="context-box">
+                                ${contextData.context || 'No context available'}
+                            </div>
+                        </div>
+
+                        <button class="refresh-btn" onclick="loadContext()">Refresh</button>
+                    `;
+
+                } catch (error) {
+                    content.innerHTML = `
+                        <div class="error">
+                            <strong>Error:</strong> Failed to load context. ${error.message}
+                        </div>
+                        <button class="refresh-btn" onclick="loadContext()">Retry</button>
+                    `;
+                }
+            }
+
+            // Load context on page load
+            loadContext();
+        </script>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html_template)
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {"status": "healthy"}
 
 
 # This is your WebSocket endpoint where Twilio will stream audio
@@ -288,6 +862,9 @@ async def websocket_endpoint(websocket: WebSocket):
     ratecv_state_to_va = None
     ratecv_state_to_twilio = None
     stream_sid = None
+    call_sid = None
+    from_number = None
+    to_number = None
     try:
         # --- Authentication ---
         # Determine the authentication method. The default is to use Application
@@ -338,6 +915,9 @@ async def websocket_endpoint(websocket: WebSocket):
         async def forward_twilio_to_va():
             """Receives messages from Twilio and forwards them to the Virtual Agent."""
             nonlocal stream_sid
+            nonlocal call_sid
+            nonlocal from_number
+            nonlocal to_number
             nonlocal ratecv_state_to_va
             nonlocal session_id
             nonlocal project_id
@@ -353,6 +933,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif event_type == "start":
                     if "start" in data and "streamSid" in data["start"]:
                         stream_sid = data["start"]["streamSid"]
+                        call_sid = data["start"]["callSid"]
+                        from_number = data["start"]["customParameters"].get("From")
+                        to_number = data["start"]["customParameters"].get("To")
                         session_id = data["start"]["customParameters"].get("session_id")
                         deployment_id = data["start"]["customParameters"].get(
                             "deployment_id"
@@ -363,8 +946,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         project_id = get_project_id_from_session_id(session_id)
                         logger.info(
                             f"Twilio Start. Stream SID: {stream_sid}, Call SID: "
-                            f"{data['start']['callSid']}, Session ID: {session_id}, "
-                            f"Project ID: {project_id}"
+                            f"{call_sid}, From: {from_number}, To: {to_number}, "
+                            f"Session ID: {session_id}, Project ID: {project_id}"
                         )
 
                         # Establish a connection to the virtual agent
@@ -522,9 +1105,57 @@ async def websocket_endpoint(websocket: WebSocket):
                             f"Invalid or unknown sessionOutput from VA: {va_data}"
                         )
                 elif "endSession" in va_data:
-                    logger.info("VA has ended the session. Closing connections.")
-                    await va_ws.close()
-                    await websocket.close()
+                    # Detect if this is an escalation
+                    is_escalation, escalation_context = await detect_escalation(va_data)
+
+                    logger.info(
+                        f"EndSession received for session {session_id}. "
+                        f"Escalation: {is_escalation}. "
+                        f"Data: {va_data}. "
+                        f"Call SID: {call_sid}"
+                    )
+
+                    if is_escalation:
+                        logger.info(
+                            f"🚨 ESCALATION DETECTED for session {session_id}. "
+                            f"Reason: {escalation_context.get('reason')}. "
+                            f"Metadata: {escalation_context.get('metadata')}. "
+                            f"Call SID: {call_sid}"
+                        )
+
+                        # Send webhook notification
+                        webhook_url = os.getenv("ESCALATION_WEBHOOK_URL")
+                        if webhook_url:
+                            await send_escalation_webhook(
+                                webhook_url=webhook_url,
+                                session_id=session_id,
+                                escalation_context=escalation_context,
+                                call_sid=call_sid,
+                                from_number=from_number,
+                                to_number=to_number,
+                            )
+
+                        # Transfer call to human agent using /transfer endpoint
+                        if BASE_URL and call_sid and from_number and to_number:
+                            await transfer_call_to_human(
+                                base_url=BASE_URL,
+                                call_sid=call_sid,
+                                from_number=from_number,
+                                to_number=to_number,
+                                escalation_context=escalation_context,
+                            )
+                        else:
+                            logger.warning(
+                                f"Cannot transfer call {call_sid}: "
+                                f"BASE_URL={BASE_URL}, from={from_number}, to={to_number}"
+                            )
+                    else:
+                        logger.info(
+                            f"VA has ended the session (non-escalation). "
+                            f"Reason: {va_data.get('endSession', {}).get('reason', 'unspecified')}"
+                        )
+
+                    # Exit loop - the finally block will handle closing connections
                     break
                 else:
                     logger.debug(f"Invalid or unknown message from VA: {va_data}")
@@ -555,15 +1186,26 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"An unexpected WebSocket error occurred: {e}", exc_info=True)
     finally:
-        if va_ws and va_ws.state != WebsocketProtocolState.CLOSED:
-            await va_ws.close()
-        if websocket.client_state != WebSocketState.DISCONNECTED:
-            await websocket.close()
+        # Close VA WebSocket if still open
+        if va_ws:
+            try:
+                if va_ws.state not in (WebsocketProtocolState.CLOSED, WebsocketProtocolState.CLOSING):
+                    await va_ws.close()
+            except Exception as e:
+                logger.debug(f"Error closing VA WebSocket (already closed?): {e}")
+
+        # Close Twilio WebSocket if still open
+        try:
+            if websocket.client_state not in (WebSocketState.DISCONNECTED,):
+                await websocket.close()
+        except Exception as e:
+            logger.debug(f"Error closing Twilio WebSocket (already closed?): {e}")
+
         logger.info("All WebSocket connections closed.")
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)

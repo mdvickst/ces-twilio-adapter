@@ -23,5 +23,11 @@ wheels/
 # Virtual environments
 .venv
 
+# Environment variables
+.env
+
 # file with deployment values
 script/values.sh
+
+#number mappings file
+number_mappings.json
